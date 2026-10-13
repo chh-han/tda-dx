@@ -31,8 +31,6 @@ way and must be set up separately:
 - `BeatNet` — beat tracking for the rhythmic channel.
 - `omnizart` — chord estimation for the harmonic channel.
 
-CUDA-capable GPUs are required for stages 5 and 6.
-
 ## Repository layout
 
 ```
@@ -44,6 +42,18 @@ bash/          Reference shell wrappers around the numbered scripts
 tests/         Smoke tests
 third_party/   Vendored dependencies made importable through tda_dx/__init__.py
 ```
+
+## Pre-trained models
+
+The CLAP RVQ and MERT k-means tokenizers are not trained here: the paper run
+uses the pretrained checkpoints released by
+[open-musiclm](https://github.com/zhvng/open-musiclm). Point `--rvq_path` and
+`--kmeans_path` (stages 3 and 5) at those files.
+
+The three transformer checkpoints (semantic, coarse, fine), the tokenized FMA
+Large corpus with its split, the generated test queries and the embedding-baseline
+score matrices are available at
+[huggingface.co/buckets/chh-han/tda-dx](https://huggingface.co/buckets/chh-han/tda-dx).
 
 ## The 7-stage pipeline
 
@@ -74,15 +84,10 @@ bash bash/07_analyze.sh
 bash bash/07_diagnose.sh
 ```
 
-Stage 5 trains three transformer stages sequentially and is the dominant
-compute cost (multiple GPUs, several days end-to-end). Stage 6 attribution
-runs are also GPU-bound but shorter; analysis (stage 7) is CPU-only.
 
 ## Symbolic-music ground-truth evaluation (`dattri_gt/`)
 
-Audio extraction is unavoidably noisy (Omnizart chord estimates, librosa
-beat tracking, etc.). To verify TDA-Dx's reliability + homogeneity
-diagnostics independently, `scripts/dattri_gt/` and `bash/dattri_gt/`
+To verify TDA-Dx's reliability + homogeneity diagnostics independently, `scripts/dattri_gt/` and `bash/dattri_gt/`
 run the same diagnostics on the
 [dattri](https://github.com/TRAIS-Lab/dattri) MAESTRO + MusicTransformer
 benchmark, where every input is exact MIDI and the four attribution
@@ -120,18 +125,6 @@ reproduce the canonical run.
 The train / validation / test split is FMA's official `set.split` column in
 `fma_metadata/tracks.csv`. Stage 3 records it per segment in
 `idx_to_split.json` next to the preprocessed tokens.
-
-## Pre-trained models
-
-The CLAP RVQ and MERT k-means tokenizers are not trained here: the paper run
-uses the pretrained checkpoints released by
-[open-musiclm](https://github.com/zhvng/open-musiclm). Point `--rvq_path` and
-`--kmeans_path` (stages 3 and 5) at those files.
-
-The three transformer checkpoints (semantic, coarse, fine), the tokenized FMA
-Large corpus with its split, the generated test queries and the embedding-baseline
-score matrices are available at
-[huggingface.co/buckets/chh-han/tda-dx](https://huggingface.co/buckets/chh-han/tda-dx).
 
 ## Reproducing the paper
 
