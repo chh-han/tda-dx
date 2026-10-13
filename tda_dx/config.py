@@ -1,0 +1,577 @@
+import json
+import os
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import torch
+from beartype.typing import Literal, Optional, List
+
+from tda_dx.models.clap_quantized import ClapQuantized, create_clap_quantized
+from tda_dx.models.encodec_wrapper import EncodecWrapper, create_encodec_24khz
+from tda_dx.models.hubert_kmeans import HfHubertWithKmeans, get_hubert_kmeans
+from tda_dx.models.types import NeuralCodec
+from tda_dx.models.musiclm import (MusicLM, TokenConditionedTransformer,
+                           create_coarse_transformer, create_fine_transformer,
+                           create_semantic_transformer)
+from tda_dx.models.stable_audio_rvq import StableAudioRVQCodec, load_stable_audio_autoencoder
+from tda_dx.training.trainer import ClapRVQTrainer, HfHubertKmeansTrainer, SingleStageTrainer
+from tda_dx.preprocessing.tokens import DataPreprocessor
+from tda_dx.utils import exists, beartype_jit
+
+
+@dataclass
+class ClapRVQConfig:
+    rq_num_quantizers: int
+    codebook_size: int
+    enable_fusion: bool = False
+    rq_ema_decay: float = 0.95
+    threshold_ema_dead_code: float = 0.0
+    checkpoint_path: Optional[str] = None
+    amodel_type: str = 'HTSAT-tiny'
+
+@dataclass
+class HubertKmeansConfig:
+    model_name: str
+    normalize_embeds: bool
+    embed_layer: int = 7
+    target_sample_hz: int = 16000
+    seq_len_multiple_of: int = 320
+    codebook_size: int = 1024
+    output_hz: int = 50
+
+@dataclass
+class EncodecConfig:
+    bandwidth: float
+    codebook_size: int
+    output_hz: int = 75
+
+@dataclass
+class DacConfig:
+    checkpoint_path: str
+    num_quantizers: int
+    codebook_size: int
+    output_hz: int
+    # fallback when DAC config is used with EncodecWrapper runtime
+    bandwidth: float = 6.0
+
+@dataclass
+class StableAudioRVQConfig:
+    rq_num_quantizers: int
+    codebook_size: int
+    output_hz: int
+    pretrained_name: Optional[str] = None
+    model_config_path: Optional[str] = None
+    ckpt_path: Optional[str] = None
+    rvq_checkpoint_path: Optional[str] = None
+    rq_ema_decay: float = 0.95
+    threshold_ema_dead_code: float = 0.0
+
+RelativePositionBiasType = Literal['continuous', 't5', 'none']
+
+@dataclass
+class SemanticConfig:
+    dim: int = 1024
+    depth: int = 6
+    heads: int = 8
+    dim_head: int = 64
+    num_kv_heads: int = 1
+    attn_dropout: float = 0.0
+    ff_dropout: float = 0.1
+    use_conv_ff: bool = True
+    grad_shrink_alpha: float = 0.1
+    non_causal_prefix_size: int = 0
+    relative_position_bias_type: RelativePositionBiasType = 'continuous'
+    use_memory_efficient_attention: bool = False
+    use_xsa: bool = False
+    use_absolute_position_embeddings: bool = False
+    max_absolute_position_embeddings: int = 12 + 250
+
+@dataclass
+class CoarseConfig:
+    dim: int = 1024
+    depth: int = 6
+    heads: int = 8
+    dim_head: int = 64
+    num_kv_heads: int = 1
+    attn_dropout: float = 0.0
+    ff_dropout: float = 0.1
+    use_conv_ff: bool = True
+    grad_shrink_alpha: float = 0.1
+    non_causal_prefix_size: int = 0
+    relative_position_bias_type: RelativePositionBiasType = 'continuous'
+    use_memory_efficient_attention: bool = False
+    use_xsa: bool = False
+    use_absolute_position_embeddings: bool = False
+    max_absolute_position_embeddings: int = 12 + 100 + 600
+@dataclass
+class FineConfig:
+    dim: int = 1024
+    depth: int = 6
+    heads: int = 8
+    dim_head: int = 64
+    num_kv_heads: int = 1
+    attn_dropout: float = 0.0
+    ff_dropout: float = 0.1
+    use_conv_ff: bool = True
+    grad_shrink_alpha: float = 0.1
+    non_causal_prefix_size: int = 0
+    relative_position_bias_type: RelativePositionBiasType = 'continuous'
+    use_memory_efficient_attention: bool = False
+    use_xsa: bool = False
+    use_absolute_position_embeddings: bool = False
+    max_absolute_position_embeddings: int = 12 + 300 + 900
+@dataclass
+class GlobalConfig:
+    semantic_audio_length_seconds: float = 10.0
+    coarse_audio_length_seconds: float = 4.0
+    fine_audio_length_seconds: float = 2.0
+    clap_audio_length_seconds: float = 10.0
+    num_coarse_quantizers: int = 3
+    num_fine_quantizers: int = 5
+
+@beartype_jit
+@dataclass
+class MusicLMModelConfig:
+    clap_rvq_cfg: ClapRVQConfig
+    hubert_kmeans_cfg: HubertKmeansConfig
+    semantic_cfg: SemanticConfig
+    coarse_cfg: CoarseConfig
+    fine_cfg: FineConfig
+    global_cfg: GlobalConfig
+    encodec_cfg: Optional[EncodecConfig] = None
+    dac_cfg: Optional[DacConfig] = None
+    stable_audio_rvq_cfg: Optional[StableAudioRVQConfig] = None
+
+    @property
+    def acoustic_codebook_size(self) -> int:
+        if exists(self.stable_audio_rvq_cfg):
+            return self.stable_audio_rvq_cfg.codebook_size
+        if exists(self.dac_cfg):
+            return self.dac_cfg.codebook_size
+        assert exists(self.encodec_cfg), 'one of stable_audio_rvq_cfg, dac_cfg, or encodec_cfg must be provided'
+        return self.encodec_cfg.codebook_size
+
+    @property
+    def acoustic_output_hz(self) -> int:
+        if exists(self.stable_audio_rvq_cfg):
+            return self.stable_audio_rvq_cfg.output_hz
+        if exists(self.dac_cfg):
+            return self.dac_cfg.output_hz
+        assert exists(self.encodec_cfg), 'one of stable_audio_rvq_cfg, dac_cfg, or encodec_cfg must be provided'
+        return self.encodec_cfg.output_hz
+
+
+@dataclass
+class ClapRVQTrainerConfig:
+    folder: str
+    num_train_steps: int
+    batch_size: int
+    accumulate_batches: int
+    save_model_every: int
+    save_results_every: int
+    input_audio_format: str = 'audio'
+    npy_sample_hz: int = 48000
+    num_workers: int = 0
+    prefetch_factor: int = 2
+    persistent_workers: bool = False
+    pin_memory: bool = False
+
+@dataclass
+class HubertKmeansTrainerConfig:
+    folder: str
+    feature_extraction_num_steps: int
+    feature_extraction_batch_size: int
+    input_audio_format: str = 'audio'
+    npy_sample_hz: int = 48000
+
+@dataclass
+class SingleStageTrainerConfig:
+    stage: str
+    folder: str
+    valid_frac: float
+    lr: float
+    lr_warmup: int
+    batch_size: int
+    grad_accum_every: int
+    wd: float
+    max_grad_norm: float
+    cross_entropy_loss_weights: list[float]
+    num_train_steps: int
+    save_results_every: int
+    save_model_every: int
+    save_predicted_tokens: bool
+    save_reconstructed_wave: bool
+    use_preprocessed_data: bool
+    valid_freq: float = 1.0
+    val_every_n_epochs: int = 0
+    val_every_n_steps: int = 0
+    save_top_k_checkpoints: int = 0
+    num_workers: int = 0
+    prefetch_factor: int = 2
+    persistent_workers: bool = False
+    pin_memory: bool = False
+    val_early_stop_patience_validations: int = 0
+    val_early_stop_patience_epochs: int = 0
+    val_early_stop_metric: str = 'loss'
+    lr_schedule: str = 'constant'  # 'constant' or 'cosine'
+    lr_min_factor: float = 0.01    # minimum LR as fraction of peak LR (for cosine)
+    exhaustive_stride: int = 1     # stride (in seconds) between exhaustive traversal anchor positions
+    jitter_seconds: float = 0.0   # random token-level jitter range (in seconds, ±)
+
+@dataclass
+class DataPreprocessorConfig:
+    folder: str = './data/fma_large'
+    metadata_folder: str = "./data/fma_metadata"
+    results_folder: str = './fma_preprocessed'
+    max_audio_length_seconds: int = 30
+    random_crop: bool = True
+    num_crops: int = 1
+    clap_batch_size: int = 32
+    preprocess_batch_size: int = 1
+    num_workers: int = 0
+    prefetch_factor: int = 2
+    target_lufs: Optional[float] = None
+
+@beartype_jit
+@dataclass
+class MusicLMTrainingConfig:
+    clap_rvq_trainer_cfg: ClapRVQTrainerConfig
+    hubert_kmeans_trainer_cfg: HubertKmeansTrainerConfig
+    semantic_trainer_cfg: SingleStageTrainerConfig
+    coarse_trainer_cfg: SingleStageTrainerConfig
+    fine_trainer_cfg: SingleStageTrainerConfig
+    data_preprocessor_cfg: DataPreprocessorConfig
+
+
+@beartype_jit
+def load_model_config(config_path: str) -> MusicLMModelConfig:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    encodec_cfg = EncodecConfig(**config['encodec_cfg']) if 'encodec_cfg' in config else None
+    dac_cfg = DacConfig(**config['dac_cfg']) if 'dac_cfg' in config else None
+    stable_audio_rvq_cfg = StableAudioRVQConfig(**config['stable_audio_rvq_cfg']) if 'stable_audio_rvq_cfg' in config else None
+    if not exists(encodec_cfg) and not exists(dac_cfg) and not exists(stable_audio_rvq_cfg):
+        raise ValueError('model config must include one of "encodec_cfg", "dac_cfg", or "stable_audio_rvq_cfg"')
+
+    return MusicLMModelConfig(
+        clap_rvq_cfg=ClapRVQConfig(**config['clap_rvq_cfg']),
+        hubert_kmeans_cfg=HubertKmeansConfig(**config['hubert_kmeans_cfg']),
+        encodec_cfg=encodec_cfg,
+        dac_cfg=dac_cfg,
+        stable_audio_rvq_cfg=stable_audio_rvq_cfg,
+        semantic_cfg=SemanticConfig(**config['semantic_cfg']),
+        coarse_cfg=CoarseConfig(**config['coarse_cfg']),
+        fine_cfg=FineConfig(**config['fine_cfg']),
+        global_cfg=GlobalConfig(**config['global_cfg']),
+    )
+
+@beartype_jit
+def load_training_config(config_path: str) -> MusicLMTrainingConfig:
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    return MusicLMTrainingConfig(
+        clap_rvq_trainer_cfg=ClapRVQTrainerConfig(**config['clap_rvq_trainer_cfg']),
+        hubert_kmeans_trainer_cfg=HubertKmeansTrainerConfig(**config['hubert_kmeans_trainer_cfg']),
+        semantic_trainer_cfg=SingleStageTrainerConfig(**config['semantic_trainer_cfg']),
+        coarse_trainer_cfg=SingleStageTrainerConfig(**config['coarse_trainer_cfg']),
+        fine_trainer_cfg=SingleStageTrainerConfig(**config['fine_trainer_cfg']),
+        data_preprocessor_cfg=DataPreprocessorConfig(**config['data_preprocessor_cfg']),
+    )
+
+# helper functions
+
+def load_model(model, path):
+    """helper class to load a model checkpoint"""
+    path = Path(path)
+    assert path.exists(), f'checkpoint does not exist at {str(path)}'
+    pkg = torch.load(str(path))
+    model.load_state_dict(pkg)
+
+class disable_print:
+    def __enter__(self):
+        self._original_stdout = sys.stdout
+        sys.stdout = open(os.devnull, 'w')
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout.close()
+        sys.stdout = self._original_stdout
+
+# model stages
+
+@beartype_jit
+def create_clap_quantized_from_config(model_config: MusicLMModelConfig, rvq_path: Optional[str], device, **kwargs) -> ClapQuantized:
+    with disable_print():
+        return create_clap_quantized(
+            **asdict(model_config.clap_rvq_cfg),
+            device=device,
+            learn_rvq=False,
+            rvq_checkpoint_path=rvq_path,
+            **kwargs,
+        ).to(device)
+
+@beartype_jit
+def create_hubert_kmeans_from_config(model_config: MusicLMModelConfig, kmeans_path: Optional[str], device, **kwargs) -> HfHubertWithKmeans:
+    return get_hubert_kmeans(
+        **asdict(model_config.hubert_kmeans_cfg),
+        kmeans_path=kmeans_path,
+        **kwargs,
+    ).to(device)
+
+@beartype_jit
+def create_neural_codec_from_config(model_config: MusicLMModelConfig, device, **kwargs) -> NeuralCodec:
+    if exists(model_config.stable_audio_rvq_cfg):
+        stable_cfg = model_config.stable_audio_rvq_cfg
+        autoencoder, _ = load_stable_audio_autoencoder(
+            pretrained_name=stable_cfg.pretrained_name,
+            model_config_path=stable_cfg.model_config_path,
+            ckpt_path=stable_cfg.ckpt_path,
+        )
+        codec = StableAudioRVQCodec(
+            autoencoder=autoencoder,
+            rq_num_quantizers=stable_cfg.rq_num_quantizers,
+            codebook_size=stable_cfg.codebook_size,
+            output_hz=stable_cfg.output_hz,
+            rvq_checkpoint_path=stable_cfg.rvq_checkpoint_path,
+            rq_ema_decay=stable_cfg.rq_ema_decay,
+            threshold_ema_dead_code=stable_cfg.threshold_ema_dead_code,
+            **kwargs,
+        )
+        return codec.to(device)
+
+    if exists(model_config.encodec_cfg):
+        return create_encodec_24khz(**asdict(model_config.encodec_cfg), **kwargs).to(device)
+
+    assert exists(model_config.dac_cfg), 'one of stable_audio_rvq_cfg, dac_cfg, or encodec_cfg must be provided'
+    # Compatibility path: map DAC acoustic settings to EncodecWrapper runtime.
+    return create_encodec_24khz(
+        bandwidth=model_config.dac_cfg.bandwidth,
+        codebook_size=model_config.dac_cfg.codebook_size,
+        output_hz=model_config.dac_cfg.output_hz,
+        **kwargs,
+    ).to(device)
+
+@beartype_jit
+def create_encodec_from_config(model_config: MusicLMModelConfig, device, **kwargs) -> NeuralCodec:
+    return create_neural_codec_from_config(model_config, device, **kwargs)
+
+@beartype_jit
+def create_semantic_transformer_from_config(
+    model_config: MusicLMModelConfig,
+    checkpoint_path: Optional[str],
+    device,
+    **kwargs,
+) -> TokenConditionedTransformer:
+    transformer = create_semantic_transformer(
+        **asdict(model_config.semantic_cfg),
+        clap_codebook_size=model_config.clap_rvq_cfg.codebook_size,
+        semantic_codebook_size=model_config.hubert_kmeans_cfg.codebook_size,
+        num_clap_quantizers=model_config.clap_rvq_cfg.rq_num_quantizers,
+        **kwargs,
+    ).to(device)
+
+    if exists(checkpoint_path):
+        load_model(transformer, checkpoint_path)
+
+    return transformer
+
+@beartype_jit
+def create_coarse_transformer_from_config(
+    model_config: MusicLMModelConfig,
+    checkpoint_path: Optional[str],
+    device,
+    **kwargs,
+) -> TokenConditionedTransformer:
+    transformer = create_coarse_transformer(
+        **asdict(model_config.coarse_cfg),
+        clap_codebook_size=model_config.clap_rvq_cfg.codebook_size,
+        semantic_codebook_size=model_config.hubert_kmeans_cfg.codebook_size,
+        acoustic_codebook_size=model_config.acoustic_codebook_size,
+        num_clap_quantizers=model_config.clap_rvq_cfg.rq_num_quantizers,
+        num_coarse_quantizers=model_config.global_cfg.num_coarse_quantizers,
+        **kwargs,
+    ).to(device)
+
+    if exists(checkpoint_path):
+        load_model(transformer, checkpoint_path)
+
+    return transformer
+
+@beartype_jit
+def create_fine_transformer_from_config(
+    model_config: MusicLMModelConfig,
+    checkpoint_path: Optional[str],
+    device,
+    **kwargs,
+) -> TokenConditionedTransformer:
+    transformer = create_fine_transformer(
+        **asdict(model_config.fine_cfg),
+        clap_codebook_size=model_config.clap_rvq_cfg.codebook_size,
+        acoustic_codebook_size=model_config.acoustic_codebook_size,
+        num_clap_quantizers=model_config.clap_rvq_cfg.rq_num_quantizers,
+        num_coarse_quantizers=model_config.global_cfg.num_coarse_quantizers,
+        num_fine_quantizers=model_config.global_cfg.num_fine_quantizers,
+        **kwargs,
+    ).to(device)
+
+    if exists(checkpoint_path):
+        load_model(transformer, checkpoint_path)
+
+    return transformer
+
+# trainers
+
+@beartype_jit
+def create_clap_rvq_trainer_from_config(
+    model_config: MusicLMModelConfig,
+    training_config: MusicLMTrainingConfig,
+    clap: ClapQuantized,
+    results_folder: str,
+    device,
+    accelerate_kwargs: dict = {},
+    config_paths: Optional[List[str]] = None,
+    **kwargs,
+):
+    trainer = ClapRVQTrainer(
+        audio_conditioner=clap,
+        results_folder=results_folder,
+        data_max_length_seconds=model_config.global_cfg.semantic_audio_length_seconds,
+        accelerate_kwargs=accelerate_kwargs,
+        config_paths=config_paths,
+        **asdict(training_config.clap_rvq_trainer_cfg),
+        **kwargs,
+    ).to(device)
+
+    return trainer
+
+@beartype_jit
+def create_hubert_kmeans_trainer_from_config(
+    model_config: MusicLMModelConfig,
+    training_config: MusicLMTrainingConfig,
+    hubert_kmeans: HfHubertWithKmeans,
+    results_folder: str,
+    device,
+    config_paths: Optional[List[str]] = None,
+    **kwargs,
+):
+    trainer = HfHubertKmeansTrainer(
+        hubert_kmeans=hubert_kmeans,
+        results_folder=results_folder,
+        data_max_length_seconds=model_config.global_cfg.semantic_audio_length_seconds,
+        config_paths=config_paths,
+        **asdict(training_config.hubert_kmeans_trainer_cfg),
+        **kwargs,
+    ).to(device)
+
+    return trainer
+
+@beartype_jit
+def create_single_stage_trainer_from_config(
+    model_config: MusicLMModelConfig,
+    training_config: MusicLMTrainingConfig,
+    stage: Literal['semantic', 'coarse', 'fine'],
+    results_folder: str,
+    transformer: TokenConditionedTransformer,
+    clap: Optional[ClapQuantized]=None,
+    wav2vec: Optional[HfHubertWithKmeans]=None,
+    encodec_wrapper: Optional[NeuralCodec]=None,
+    device='cpu',
+    accelerate_kwargs: dict = {},
+    config_paths: Optional[List[str]] = None,
+    **kwargs,
+) -> SingleStageTrainer:
+
+    semantic_audio_length_seconds = model_config.global_cfg.semantic_audio_length_seconds
+    coarse_audio_length_seconds = model_config.global_cfg.coarse_audio_length_seconds
+    fine_audio_length_seconds = model_config.global_cfg.fine_audio_length_seconds
+
+    if stage == 'semantic':
+        trainer_cfg = training_config.semantic_trainer_cfg
+        data_max_length_seconds = (semantic_audio_length_seconds, semantic_audio_length_seconds)
+    elif stage == 'coarse':
+        trainer_cfg = training_config.coarse_trainer_cfg
+        data_max_length_seconds = (semantic_audio_length_seconds, coarse_audio_length_seconds, coarse_audio_length_seconds)
+    elif stage == 'fine':
+        trainer_cfg = training_config.fine_trainer_cfg
+        data_max_length_seconds = (semantic_audio_length_seconds, fine_audio_length_seconds)
+
+    trainer = SingleStageTrainer(
+        model_config=model_config,
+        training_config=training_config,
+        transformer=transformer,
+        audio_conditioner=clap,
+        wav2vec=wav2vec,
+        neural_codec=encodec_wrapper,
+        results_folder=results_folder,
+        data_max_length_seconds=data_max_length_seconds,
+        accelerate_kwargs=accelerate_kwargs,
+        config_paths=config_paths,
+        **asdict(trainer_cfg),
+        **kwargs,
+    ).to(device)
+
+    return trainer
+
+@beartype_jit
+def create_data_preprocessor_from_config(
+    model_config: MusicLMModelConfig,
+    training_config: MusicLMTrainingConfig,
+    clap: ClapQuantized,
+    wav2vec: HfHubertWithKmeans,
+    encodec_wrapper: NeuralCodec,
+    device='cpu',
+    config_paths: Optional[List[str]] = None,
+    input_audio_format = None,
+    **kwargs,
+):
+    data_preprocessor = DataPreprocessor(
+        audio_conditioner=clap,
+        wav2vec=wav2vec,
+        neural_codec=encodec_wrapper,
+        num_coarse_quantizers=model_config.global_cfg.num_coarse_quantizers,
+        num_fine_quantizers=model_config.global_cfg.num_fine_quantizers,
+        semantic_audio_length_seconds=model_config.global_cfg.semantic_audio_length_seconds,
+        coarse_audio_length_seconds=model_config.global_cfg.coarse_audio_length_seconds,
+        fine_audio_length_seconds=model_config.global_cfg.fine_audio_length_seconds,
+        clap_audio_length_seconds=model_config.global_cfg.clap_audio_length_seconds,
+        config_paths=config_paths,
+        input_audio_format=input_audio_format,
+        **asdict(training_config.data_preprocessor_cfg),
+        **kwargs,
+    ).to(device)
+
+    return data_preprocessor
+
+# entire model
+
+@beartype_jit
+def create_musiclm_from_config(
+    model_config: MusicLMModelConfig,
+    semantic_path: str,
+    coarse_path: str,
+    fine_path: str,
+    rvq_path: str,
+    kmeans_path: str,
+    device,
+    **kwargs,
+):
+    clap = create_clap_quantized_from_config(model_config, rvq_path, device)
+    wav2vec = create_hubert_kmeans_from_config(model_config, kmeans_path, device)
+    encodec_wrapper = create_neural_codec_from_config(model_config, device)
+    semantic_transformer = create_semantic_transformer_from_config(model_config, semantic_path, device)
+    coarse_transformer = create_coarse_transformer_from_config(model_config, coarse_path, device)
+    fine_transformer = create_fine_transformer_from_config(model_config, fine_path, device)
+
+    musiclm = MusicLM(
+        wav2vec=wav2vec,
+        clap=clap,
+        neural_codec=encodec_wrapper,
+        semantic_transformer=semantic_transformer,
+        coarse_transformer=coarse_transformer,
+        fine_transformer=fine_transformer,
+        **kwargs,
+    ).to(device)
+
+    return musiclm

@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.eggs/
+CLAUDE.md
+
+# Virtualenv / conda
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs / runs
+logs/
+runs/
+wandb/
+*.log
+
+# Checkpoints / weights
+checkpoints/
+*.pt
+*.ckpt
+*.bin
+*.safetensors
+
+# Cached data / outputs
+results/
+00results/
+cache/
+*.npy
+*.npz
+*.memmap
+*.h5
+*.hdf5
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.envrc
+*.local

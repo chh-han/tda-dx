@@ -1,0 +1,18 @@
+{
+    "stage": "semantic",
+    "method": "trak",
+    "num_train_samples": 5000,
+    "num_test_samples": 500,
+    "batch_size": 8,
+    "model_config": "./configs/model/musiclm_large.json",
+    "preprocessed_data_folder": "./fma_preprocessed",
+    "checkpoint_path": "./results/semantic/semantic.transformer.200000.pt",
+    "results_folder": "./results/attribution",
+    "trak_config": {
+        "proj_dim": 512
+    },
+    "if_cg_config": {
+        "regularization": 1e-3,
+        "max_iter": 10
+    }
+}

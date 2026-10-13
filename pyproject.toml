@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tda-dx"
+version = "0.1.0"
+description = "TDA-Dx: diagnostics for training data attribution in music generation models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "TDA-Dx authors" }]
+keywords = ["training-data-attribution", "music-generation", "musiclm", "interpretability"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.10",
+]
+dependencies = [
+  "torch>=2.0",
+  "torchaudio",
+  "torchvision",
+  "einops>=0.6.1",
+  "vector-quantize-pytorch>=1.2.2",
+  "librosa>=0.10",
+  "torchlibrosa",
+  "soundfile",
+  "transformers",
+  "encodec",
+  "accelerate>=0.17",
+  "beartype",
+  "joblib",
+  "h5py",
+  "scikit-learn",
+  "scipy",
+  "numpy",
+  "pandas",
+  "tqdm",
+  "ftfy",
+  "wandb",
+  "gdown",
+  "wget",
+  "dattri",
+  "sjlt",
+  "pretty_midi",
+  "mido",
+]
+
+[project.optional-dependencies]
+attribution = ["trak"]
+features = ["BeatNet", "omnizart"]
+dev = ["pytest", "pytest-cov", "ruff"]
+
+[project.scripts]
+tda-dx-preprocess-audio = "tda_dx.preprocessing.audio_npy:main"
+tda-dx-preprocess-tokens = "tda_dx.preprocessing.preprocess_data_cli:main"
+tda-dx-train-clap-rvq = "tda_dx.tokenizers.train_clap_rvq:main"
+tda-dx-train-hubert-kmeans = "tda_dx.tokenizers.train_hubert_kmeans:main"
+tda-dx-extract-features = "tda_dx.features.runner:main"
+tda-dx-train = "tda_dx.training.train:main"
+tda-dx-attribute = "tda_dx.attribution.pipeline.runner:main"
+tda-dx-analyze = "tda_dx.analysis.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["tda_dx*"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"

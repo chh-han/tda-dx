@@ -1,0 +1,1396 @@
+"""Projection matrix constructions.
+
+This file contains functions to (1) construct random projection (normal/Rademacher
+projection matrix and sjlt/random mask/GraSS projection) for dimension reduction and
+(2) perform eigen decomposition on the inverse Hessian matrix using Arnoldi iteration
+and derive the corresponding projection matrix.
+
+Typically, the feature will correspond to gradient w.r.t model parameters.
+
+The code is mainly adapted from https://github.com/MadryLab/trak/blob/main/trak/
+and https://github.com/google-research/jax-influence/blob/main/jax_influence/arnoldi.py,
+correspondingly.
+"""
+
+from __future__ import annotations
+
+import math
+from abc import ABC, abstractmethod
+from enum import Enum
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Dict, List, Union
+
+import warnings
+
+import torch
+from torch import Tensor
+
+from dattri.func.hessian import hvp_at_x
+
+from .utils import _vectorize as vectorize
+from .utils import get_parameter_chunk_sizes
+
+
+def _rademacher(
+    matrix: Tensor,
+    generator: torch.Generator,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Generate Rademacher random matrix in-place.
+
+    Args:
+        matrix (Tensor): The matrix to fill with Rademacher values.
+        generator (torch.Generator): Random number generator.
+        dtype (torch.dtype): Target dtype for the matrix.
+
+    Returns:
+        Tensor: The filled matrix.
+    """
+    matrix.bernoulli_(p=0.5, generator=generator)
+    matrix *= 2.0
+    matrix -= 1.0
+    return matrix.to(dtype=dtype)
+
+
+def _mask(
+    input_dim: int,
+    output_dim: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> Tensor:
+    """Generate sorted random mask indices.
+
+    Args:
+        input_dim (int): Input dimension.
+        output_dim (int): Output dimension (number of indices to select).
+        generator (torch.Generator): Random number generator.
+        device (torch.device): Device for the indices.
+
+    Returns:
+        Tensor: Sorted indices tensor.
+    """
+    indices = torch.randperm(
+        input_dim,
+        generator=generator,
+        device=device,
+    )[:output_dim]
+    return indices.sort()[0]
+
+
+def _preprocess_features(
+    features: Union[dict, Tensor],
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Convert features to tensor on correct device and dtype.
+
+    Args:
+        features (Union[dict, Tensor]): Input features.
+        device (torch.device): Target device.
+        dtype (torch.dtype): Target dtype.
+
+    Returns:
+        Tensor: Preprocessed features tensor.
+    """
+    if isinstance(features, dict):
+        features = vectorize(features, device=device)
+    elif features.device != device:
+        features = features.to(device)
+    if features.dtype != dtype:
+        features = features.to(dtype)
+    return features
+
+
+def _parse_grass_projection_type(proj_type: str) -> Tuple[str, int]:
+    """Parse grass projection type and extract multiplier.
+
+    Args:
+        proj_type (str): Projection type string (e.g., "grass" or "grass_4").
+
+    Returns:
+        Tuple[str, int]: Base projection type and grass multiplier.
+
+    Raises:
+        ValueError: If grass multiplier format is invalid.
+    """
+    grass_multiplier = 4  # Default value
+    if proj_type.startswith("grass") and "_" in proj_type:
+        parts = proj_type.split("_")
+        expected_parts_count = 2  # Expected format: "grass_N"
+        if len(parts) == expected_parts_count:
+            try:
+                grass_multiplier = int(parts[1])
+            except ValueError:
+                msg = f"Invalid grass multiplier format: {proj_type}. \
+                Expected format: 'grass_N' where N is an integer."
+                raise ValueError(msg) from None
+        proj_type = "grass"  # Normalize to base type
+    return proj_type, grass_multiplier
+
+
+class ProjectionType(str, Enum):
+    """Projection type used for projectors."""
+
+    identity: str = "identity"
+    normal: str = "normal"
+    rademacher: str = "rademacher"
+    sjlt: str = "sjlt"
+    random_mask: str = "random_mask"
+    grass: str = "grass"
+
+
+class AbstractProjector(ABC):
+    """Base Class for projectors."""
+
+    @abstractmethod
+    def __init__(
+        self,
+        feature_dim: int,
+        proj_dim: int,
+        seed: int,
+        proj_type: ProjectionType,
+        device: torch.device,
+    ) -> None:
+        """Initializes hyperparameters for the projection.
+
+        Args:
+            feature_dim (int): Dimension of the features to be projected.
+                Typically, this equals the number of parameters in the model
+                (dimension of the gradient vectors).
+            proj_dim (int): Dimension after the projection.
+            seed (int): Random seed for the generation of the sketching
+                (projection) matrix.
+            proj_type (ProjectionType): The random projection type used for the
+                projection. Available options are "sjlt" (if cuda), "rademacher",
+                "normal", "random_mask", and "identity".
+            device (torch.device): Device to use. Defaults to cpu.
+        """
+        self.feature_dim = feature_dim
+        self.proj_dim = proj_dim
+        self.seed = seed
+        self.proj_type = proj_type
+        self.device = device
+
+    @abstractmethod
+    def project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
+        """Performs the random projection on feature matrix.
+
+        This function will take features and an ensemble_id, which allows us
+        to generate different projection matrices, and output the projected
+        matrix.
+
+        Args:
+            features (Union[dict, Tensor]): A batch of features or a dictionary
+                of batch of features.
+            ensemble_id (int): A unique ID for this ensemble.
+
+        Returns:
+            Tensor: The projected features.
+        """
+
+    @abstractmethod
+    def free_memory(self) -> None:
+        """Frees up memory used by the projector."""
+
+
+class BasicProjector(AbstractProjector):
+    """A simple block-wise implementation of the projection.
+
+    The projection matrix is generated on-device in blocks.
+    The accumulated result across blocks is returned.
+
+    Note: This class will be significantly slower and have a larger memory
+    footprint than the CudaProjector. It is recommended that you use this method
+    only if the CudaProjector is not available to you -- e.g. if you don't have
+    a CUDA-enabled device with compute capability >=7.0 (see
+    https://developer.nvidia.com/cuda-gpus).
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        proj_dim: int,
+        seed: int,
+        proj_type: ProjectionType,
+        device: torch.device,
+        block_size: int = 100,
+        dtype: torch.dtype = torch.float32,
+        ensemble_id: int = 0,
+    ) -> None:
+        """Initializes hyperparameters for BasicProjector.
+
+        Args:
+            feature_dim (int): Dimension of the features to be projected.
+                Typically, this equals the number of parameters in the model
+                (dimension of the gradient vectors).
+            proj_dim (int): Dimension after the projection.
+            seed (int): Random seed for the generation of the sketching
+                (projection) matrix.
+            proj_type (ProjectionType): The random projection type used for the
+                projection. Available options are "rademacher", "normal",
+                "random_mask", and "identity".
+            device (torch.device): Device to use. Defaults to cpu.
+            block_size (int): Maximum number of projection dimension allowed.
+                Thus, min(block_size, proj_dim) will be used as the actual
+                projection dimension.
+            dtype (torch.dtype): The dtype of the projected matrix.
+            ensemble_id (int): A unique ID for this ensemble.
+        """
+        super().__init__(feature_dim, proj_dim, seed, proj_type, device)
+
+        self.block_size = min(self.proj_dim, block_size)
+        self.num_blocks = math.ceil(self.proj_dim / self.block_size)
+        self.dtype = dtype
+        self.ensemble_id = ensemble_id
+
+        if proj_type in {ProjectionType.normal, ProjectionType.rademacher}:
+            self.proj_matrix = torch.empty(
+                self.feature_dim,
+                self.block_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.proj_matrix_available = True
+
+        self.generator = torch.Generator(device=self.device)
+
+        self.get_generator_states()
+        if proj_type == ProjectionType.random_mask:
+            self._gen_randomness_mask(self.generator_states[0])
+        elif proj_type == ProjectionType.identity:
+            pass  # No randomness needed for identity projection
+        else:
+            self._gen_randomness_dense(self.generator_states[0])
+
+    def free_memory(self) -> None:
+        """Delete the projection matrix."""
+        if hasattr(self, "proj_matrix"):
+            del self.proj_matrix
+            self.proj_matrix_available = False
+
+    def get_generator_states(self) -> None:
+        """Set generator seeds for each block."""
+        self.generator_states = []
+        self.seeds = []
+        self.jl_size = self.feature_dim * self.block_size
+
+        for i in range(self.num_blocks):
+            s = self.seed + int(1e3) * i + int(1e5) * self.ensemble_id
+            self.seeds.append(s)
+            self.generator = self.generator.manual_seed(s)
+            self.generator_states.append(self.generator.get_state())
+
+    def _gen_randomness_mask(self, generator_state: List) -> None:
+        """Generate random mask indices for random_mask projection.
+
+        Args:
+            generator_state (List): A list of generator states. Usually each
+                block will be given a unique generator states.
+        """
+        self.generator.set_state(generator_state)
+        self.active_indices = _mask(
+            self.feature_dim,
+            self.proj_dim,
+            self.generator,
+            self.device,
+        )
+
+    def _gen_randomness_dense(self, generator_state: List) -> None:
+        """Set generator states and generate sketch matrices.
+
+        Args:
+            generator_state (List): A list of generator states. Usually each
+                block will be given a unique generator states.
+
+        Raises:
+            KeyError: Projection type is not recognized.
+        """
+        if not self.proj_matrix_available:
+            self.proj_matrix = torch.empty(
+                self.feature_dim,
+                self.block_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            self.proj_matrix_available = True
+
+        self.generator.set_state(generator_state)
+
+        if self.proj_type == ProjectionType.normal:
+            self.proj_matrix.normal_(generator=self.generator)
+        elif self.proj_type == ProjectionType.rademacher:
+            self.proj_matrix = _rademacher(self.proj_matrix, self.generator, self.dtype)
+        else:
+            msg = f"Projection type {self.proj_type} not recognized."
+            raise KeyError(msg)
+
+    def project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
+        """Performs the random projection on the feature matrix.
+
+        Args:
+            features (Union[dict, Tensor]): A batch of features or a dictionary
+                of batch of features.
+            ensemble_id (int): A unique ID for this ensemble.
+
+        Returns:
+            Tensor: The projected features.
+        """
+        features = _preprocess_features(features, self.device, self.dtype)
+
+        if ensemble_id != self.ensemble_id:
+            self.ensemble_id = ensemble_id
+            self.get_generator_states()  # regenerate random seeds for new ensemble_id
+            if self.proj_type == ProjectionType.random_mask:
+                self._gen_randomness_mask(self.generator_states[0])
+            elif self.proj_type == ProjectionType.identity:
+                pass  # No randomness needed for identity projection
+            elif self.num_blocks == 1:
+                self._gen_randomness_dense(self.generator_states[0])
+
+        # Handle random_mask projection separately
+        if self.proj_type == ProjectionType.random_mask:
+            return features[:, self.active_indices]
+        if self.proj_type == ProjectionType.identity:
+            return features
+
+        sketch = torch.zeros(
+            size=(features.size(0), self.proj_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        if self.num_blocks == 1:
+            torch.matmul(features.data, self.proj_matrix, out=sketch)
+        else:
+            for ind in range(self.num_blocks):
+                self._gen_randomness_dense(self.generator_states[ind])
+
+                st = ind * self.block_size
+                ed = min((ind + 1) * self.block_size, self.proj_dim)
+                sketch[:, st:ed] = (
+                    features.type(self.dtype) @ self.proj_matrix[:, : (ed - st)]
+                )
+
+        # Normalize by sqrt(proj_dim) for distance preservation
+        # (consistent with CudaProjector and Johnson-Lindenstrauss lemma)
+        sketch /= self.proj_dim**0.5
+
+        return sketch.type(features.dtype)
+
+
+class CudaProjector(AbstractProjector):
+    """Projector implemented using CUDA.
+
+    A performant implementation of the projection
+    for CUDA with compute capability >= 7.0.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        proj_dim: int,
+        seed: int,
+        proj_type: ProjectionType,
+        device: torch.device,
+        dtype: torch.dtype = torch.float32,
+        grass_multiplier: int = 4,
+    ) -> None:
+        """Initializes hyperparameters for CudaProjector.
+
+        Args:
+            feature_dim (int): Dimension of the features to be projected.
+                Typically, this equals the number of parameters in the model
+                (dimension of the gradient vectors).
+            proj_dim (int): Dimension we project *to* during the projection step
+            seed (int): Random seed.
+            proj_type (ProjectionType): The random projection type used for the
+                projection. Available options are "sjlt", "rademacher", "normal",
+                "random_mask", "grass", and "identity".
+            device (torch.device): Device to use.
+            dtype (torch.dtype): The dtype used in the projector.
+            grass_multiplier (int): For GraSS projection, the multiplier for the
+                intermediate dimension. Intermediate dim = proj_dim * grass_multiplier.
+                Defaults to 4.
+
+        Raises:
+            ValueError: When attempting to use this on a non-CUDA device.
+            ModuleNotFoundError: When sjlt is not installed.
+        """
+        super().__init__(feature_dim, proj_dim, seed, proj_type, device)
+        self.dtype = dtype
+        self.grass_multiplier = grass_multiplier
+
+        if self.device.type != "cuda":
+            err = "CudaProjector only works on a CUDA device; \
+            Either switch to a CUDA device, or use the BasicProjector"
+            raise ValueError(err)
+
+        # Use a generator for reproducible randomness
+        self.generator = torch.Generator(device=self.device)
+        # Track the current ensemble to know when to regenerate randomness
+        self.current_ensemble_id = -1  # Init to -1 to force generation on first call
+
+        # Initialize placeholders for projection components
+        if self.proj_type == ProjectionType.sjlt:
+            # Check for sjlt import early if needed
+            try:
+                from sjlt import SJLTProjection  # noqa: F401
+            except ImportError:
+                msg = "sjlt not found. Please run `pip install sjlt` to install."
+                raise ModuleNotFoundError(msg) from None
+            self.sjlt = None
+        elif self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
+            self.proj_matrix = None
+        elif self.proj_type == ProjectionType.random_mask:
+            self.active_indices = None
+        elif self.proj_type == ProjectionType.grass:
+            self.sjlt = None
+            self.active_indices = None
+
+    def _gen_randomness_sjlt(
+        self,
+        input_dim: Optional[int] = None,
+        output_dim: Optional[int] = None,
+    ) -> None:
+        """Generates randomness for 'sjlt' projection.
+
+        Args:
+            input_dim (int): Input dimension for SJLT. If None, uses self.feature_dim.
+            output_dim (int): Output dimension for SJLT. If None, uses self.proj_dim.
+        """
+        from sjlt import SJLTProjection
+
+        if input_dim is None:
+            input_dim = self.feature_dim
+        if output_dim is None:
+            output_dim = self.proj_dim
+
+        c = 1  # Hard set the column sparsity to 1
+        rand_indices = torch.randint(
+            output_dim,
+            (input_dim, c),
+            generator=self.generator,
+            device=self.device,
+        )
+        rand_signs = (
+            torch.randint(
+                0,
+                2,
+                (input_dim, c),
+                generator=self.generator,
+                device=self.device,
+            )
+            * 2
+            - 1
+        )
+
+        # Recreate SJLT object if dimensions don't match
+        need_recreate = (
+            self.sjlt is None
+            or self.sjlt.rand_indices.shape[0] != input_dim
+            or rand_indices.shape[1] != self.sjlt.rand_indices.shape[1]
+        )
+
+        if need_recreate:
+            self.sjlt = SJLTProjection(
+                input_dim,
+                output_dim,
+                c,
+                device=self.device,
+            )
+
+        self.sjlt.rand_indices.copy_(rand_indices)
+        self.sjlt.rand_signs.copy_(rand_signs.to(torch.int8))
+
+    def _gen_randomness_mask(
+        self,
+        input_dim: Optional[int] = None,
+        output_dim: Optional[int] = None,
+    ) -> None:
+        """Generate random mask indices for random_mask projection.
+
+        Args:
+            input_dim (int): Input dimension for mask. If None, uses self.feature_dim.
+            output_dim (int): Output dimension for mask. If None, uses self.proj_dim.
+        """
+        if input_dim is None:
+            input_dim = self.feature_dim
+        if output_dim is None:
+            output_dim = self.proj_dim
+
+        self.active_indices = _mask(
+            input_dim,
+            output_dim,
+            self.generator,
+            self.device,
+        )
+
+    def _gen_randomness_dense(self, method: str) -> None:
+        """Generates the random projection matrix for dense projections.
+
+        Args:
+            method (str): The method to use for generating the projection
+                matrix. Must be either "rademacher" or "normal".
+        """
+        if self.proj_matrix is None:
+            self.proj_matrix = torch.empty(
+                self.feature_dim,
+                self.proj_dim,
+                dtype=self.dtype,
+                device=self.device,
+            )
+
+        if method == "normal":
+            self.proj_matrix.normal_(generator=self.generator)
+        elif method == "rademacher":
+            self.proj_matrix = _rademacher(self.proj_matrix, self.generator, self.dtype)
+
+    def _gen_randomness_grass(self) -> None:
+        """Generates randomness for 'grass' projection (random_mask + sjlt)."""
+        # Calculate intermediate dimension
+        intermediate_dim = self.proj_dim * self.grass_multiplier
+
+        # Ensure intermediate_dim doesn't exceed feature_dim
+        if intermediate_dim > self.feature_dim:
+            intermediate_dim = self.feature_dim
+            # Update grass_multiplier to reflect actual ratio used
+            self.grass_multiplier = intermediate_dim // self.proj_dim
+
+        # Generate random mask indices (feature_dim -> intermediate_dim)
+        self._gen_randomness_mask(
+            input_dim=self.feature_dim,
+            output_dim=intermediate_dim,
+        )
+
+        # Generate SJLT projection (intermediate_dim -> proj_dim)
+        self._gen_randomness_sjlt(input_dim=intermediate_dim, output_dim=self.proj_dim)
+
+    def _generate_randomness(self, ensemble_id: int) -> None:
+        """Generates the random projection components for a given ensemble_id.
+
+        Args:
+            ensemble_id (int): A unique ID for this ensemble to generate
+                reproducible randomness.
+
+        Raises:
+            ValueError: If the projection type is unknown.
+        """
+        # Create a unique, reproducible seed for this specific ensemble
+        current_seed = self.seed + int(1e5) * ensemble_id
+        self.generator.manual_seed(current_seed)
+
+        # Initialize based on method
+        if self.proj_type == ProjectionType.sjlt:
+            self._gen_randomness_sjlt()
+        elif self.proj_type == ProjectionType.rademacher:
+            self._gen_randomness_dense("rademacher")
+        elif self.proj_type == ProjectionType.normal:
+            self._gen_randomness_dense("normal")
+        elif self.proj_type == ProjectionType.random_mask:
+            self._gen_randomness_mask()
+        elif self.proj_type == ProjectionType.grass:
+            self._gen_randomness_grass()
+        elif self.proj_type == ProjectionType.identity:
+            pass  # No randomness needed for identity projection
+        else:
+            msg = f"Unknown projection type: {self.proj_type}"
+            raise ValueError(msg)
+
+    def project(
+        self,
+        features: Union[dict, Tensor],
+        ensemble_id: int,
+    ) -> Tensor:
+        """Performs the random projection on the feature matrix.
+
+        Args:
+            features (Union[dict, Tensor]): A batch of features or a dictionary
+                of batch of features.
+            ensemble_id (int): A unique ID for this ensemble.
+
+        Returns:
+            Tensor: The projected features.
+        """
+        # Regenerate randomness if the ensemble_id has changed
+        if ensemble_id != self.current_ensemble_id:
+            self._generate_randomness(ensemble_id)
+            self.current_ensemble_id = ensemble_id
+
+        features = _preprocess_features(features, self.device, self.dtype)
+
+        if self.proj_type == ProjectionType.sjlt:
+            with torch.no_grad():
+                result = self.sjlt(features)
+
+        elif self.proj_type in [ProjectionType.rademacher, ProjectionType.normal]:
+            result = features @ self.proj_matrix / (self.proj_dim**0.5)
+
+        elif self.proj_type == ProjectionType.random_mask:
+            result = features[:, self.active_indices]
+
+        elif self.proj_type == ProjectionType.grass:
+            # Stage 1: random_mask (feature_dim -> intermediate_dim)
+            intermediate = features[:, self.active_indices]
+            # Stage 2: sjlt (intermediate_dim -> proj_dim)
+            with torch.no_grad():
+                result = self.sjlt(intermediate)
+        elif self.proj_type == ProjectionType.identity:
+            result = features
+
+        return result
+
+    def free_memory(self) -> None:
+        """A no-op method."""
+
+
+class ChunkedCudaProjector:
+    """Chunked CudaProjector implemented using CUDA.
+
+    This projector is used when (# dim of features)*(# batch size) is too large.
+    If the features are gradients, then (# dim of features) equals to the number
+    of parameters in the model.
+    """
+
+    def __init__(
+        self,
+        projector_per_chunk: list,
+        max_chunk_size: int,
+        dim_per_chunk: list,
+        feature_batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        """Initializes hyperparameters for ChunkedCudaProjector.
+
+        Args:
+            projector_per_chunk (list): A list of projectors. Specifying
+                the projector used by each chunk.
+            max_chunk_size (int): The maximum size of each chunk.
+            dim_per_chunk (list): The number of feature dimensions per chunk.
+            feature_batch_size (int): The batch size of input feature.
+            device (torch.device): Device to use.
+            dtype (torch.dtype): The dtype of the projected matrix.
+        """
+        self.projector_per_chunk = projector_per_chunk
+        self.proj_dim = self.projector_per_chunk[0].proj_dim
+        self.proj_type = self.projector_per_chunk[0].proj_type
+        self.dim_per_chunk = dim_per_chunk
+        self.feature_batch_size = feature_batch_size
+        self.max_chunk_size = max_chunk_size
+        self.device = device
+        self.dtype = dtype
+        self.input_allocated = False
+
+    def allocate_input(self) -> None:
+        """Allocate zero tensor for input."""
+        if self.input_allocated:
+            return
+
+        self.ch_input = torch.zeros(
+            size=(self.feature_batch_size, self.max_chunk_size),
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        self.input_allocated = True
+
+    def free_memory(self) -> None:
+        """Frees up memory used by the projector."""
+        if not self.input_allocated:
+            return
+
+        del self.ch_input
+        self.input_allocated = False
+
+    def dict_project(self, features: Union[dict, Tensor], ensemble_id: int) -> Tensor:
+        """Performs the random projection on the feature matrix.
+
+        Args:
+            features (Union[dict, Tensor]): A batch of features or a dictionary
+                of batch of features.
+            ensemble_id (int): A unique ID for this ensemble.
+
+        Raises:
+            ValueError: The number of accumulated #feature dim does not match
+                dim_per_chunk.
+
+        Returns:
+            Tensor: The projected features.
+        """
+        self.allocate_input()
+        ch_output = torch.zeros(
+            size=(self.feature_batch_size, self.proj_dim),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        pointer = 0
+        # iterate over feature dimensions, keep a counter of #dim so far, and when prev
+        # chunk reaches max_chunk_size, project and accumulate.
+        projector_index = 0
+        vector_dim = 1
+        for _, p in enumerate(features.values()):
+            # check the shape of p, if vector then unsqueeze.
+            if len(p.shape) <= vector_dim:
+                p_flat = p.data.unsqueeze(-1)
+            else:
+                p_flat = p.data.flatten(start_dim=1)
+
+            feature_dim_size = p_flat.size(1)
+            # if current accumulated params exceed max_chunk_size,
+            # then stop accumulation.
+            if pointer + feature_dim_size > self.max_chunk_size:
+                # fill remaining entries with 0
+                if pointer != self.dim_per_chunk[projector_index]:
+                    msg = "Current number of accumulated #dim does not match \
+                    the #feature dim of current chunk."
+                    raise ValueError(msg)
+                # project and accumulate
+                ch_output.add_(
+                    self.projector_per_chunk[projector_index].project(
+                        self.ch_input[:, :pointer].contiguous(),
+                        ensemble_id=ensemble_id,
+                    ),
+                )
+                # reset counter
+                pointer = 0
+                projector_index += 1
+
+            # continue accumulation
+            actual_bs = min(self.ch_input.size(0), p_flat.size(0))
+            self.ch_input[:actual_bs, pointer : pointer + feature_dim_size].copy_(
+                p_flat,
+            )
+            pointer += feature_dim_size
+
+        # at the end, we need to project remaining items
+        # fill remaining entries with 0
+        if pointer != self.dim_per_chunk[projector_index]:
+            msg = "Current number of accumulated #dim does not match \
+                    the #feature dim of current chunk."
+            raise ValueError(msg)
+
+        # project and accumulate
+        ch_output[:actual_bs].add_(
+            self.projector_per_chunk[projector_index].project(
+                self.ch_input[:actual_bs, :pointer].contiguous(),
+                ensemble_id=ensemble_id,
+            ),
+        )
+
+        return ch_output[:actual_bs]
+
+    def project(self, features: Tensor, ensemble_id: int) -> Tensor:
+        """Performs the random projection on a flattened feature tensor.
+
+        For dict inputs (e.g., model gradients), use dict_project() instead,
+        or use the random_project() factory function which handles routing.
+
+        Args:
+            features (Tensor): A batch of flattened features with shape
+                (batch_size, feature_dim).
+            ensemble_id (int): A unique ID for this ensemble.
+
+        Returns:
+            Tensor: The projected features with shape (batch_size, proj_dim).
+
+        Raises:
+            TypeError: If features is a dict. Use dict_project() for dict inputs.
+        """
+        if isinstance(features, dict):
+            msg = (
+                "ChunkedCudaProjector.project() only accepts Tensor inputs. "
+                "For dict inputs, use dict_project() or the random_project() "
+                "factory function which handles routing automatically."
+            )
+            raise TypeError(msg)
+
+        if features.device.type != self.device:
+            features = features.to(self.device)
+
+        # Allocate output tensor with actual batch size
+        batch_size = features.shape[0]
+        ch_output = torch.zeros(
+            size=(batch_size, self.proj_dim),
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+        pointer = 0
+        for chunk_idx, chunk_dim in enumerate(self.dim_per_chunk):
+            ch_output.add_(
+                self.projector_per_chunk[chunk_idx].project(
+                    features[:, pointer : pointer + chunk_dim].contiguous(),
+                    ensemble_id=ensemble_id,
+                ),
+            )
+
+            pointer += chunk_dim
+
+        return ch_output
+
+
+class ArnoldiProjector(AbstractProjector):
+    """Implementation of Arnoldi projector."""
+
+    def __init__(
+        self,
+        feature_dim: int,
+        proj_dim: int,
+        func: Callable,
+        x: Tuple,
+        argnums: int = 0,
+        max_iter: int = 100,
+        norm_constant: float = 1.0,
+        tol: float = 1e-7,
+        mode: str = "rev-fwd",
+        regularization: float = 0.0,
+        seed: int = 0,
+        device: torch.device = "cpu",
+    ) -> None:
+        """Initializes hyperparameters for ArnoldiProjector.
+
+        Args:
+            feature_dim (int): Dimension of the features to be projected.
+                Typically, this equals the number of parameters in the model
+                (dimension of the gradient vectors).
+            proj_dim (int): Dimension after the projection. This corresponds to
+                the number of top eigenvalues (top-k eigenvalues) to keep for
+                the Hessian approximation.
+            func (Callable): A Python function that takes one or more
+                arguments. Must return a single-element Tensor. The Hessian
+                will be calculated on this function.
+            x (Tuple): List of arguments for `func`.
+            argnums (int): An integer defaulting to 0. Specifies which argument
+                of func to compute inverse Hessian with respect to.
+            max_iter (int): An integer defaulting to 100. Specifies the maximum
+                iteration to calculate the ihvp through Arnoldi Iteration.
+            norm_constant (float): A float defaulting to 1.0. Specifies a
+                constant value for the norm of each projection. In some
+                situations (e.g. with a large number of parameters) it might be
+                advisable to set norm_constant > 1 to avoid dividing projection
+                components by a large normalization factor.
+            tol (float): A float defaulting to 1e-7. Specifies the break
+                condition that decides if the algorithm has converged. If the
+                torch.norm of current basis vector is less than tol, then the
+                arnoldi_iter algorithm is truncated.
+            mode (str): The auto diff mode, which can have one of the following
+                values:
+                - rev-rev: calculate the Hessian with two reverse-mode
+                  auto-diff. It has better compatibility while costing more
+                  memory.
+                - rev-fwd: calculate the Hessian with the composition of
+                  reverse-mode and forward-mode. It's more memory-efficient but
+                  may not be supported by some operators.
+            regularization (float): A float defaulting to 0.0. Specifies the
+                regularization term to be added to the Hessian vector product,
+                which is useful for the later inverse calculation if the
+                Hessian matrix is singular or ill-conditioned. Specifically,
+                the regularization term is `regularization * v`.
+            seed (int): Random seed for the generation of the random initial
+                vector to build orthonormal basis for the Krylov subspaces.
+            device (torch.device): Device to use. Defaults to cpu.
+        """
+        self.max_iter = max_iter
+        self.norm_constant = norm_constant
+        self.tol = tol
+        # get hvp func
+        self.hvp_at_x_func = hvp_at_x(
+            func,
+            x=(x,),
+            argnums=argnums,
+            mode=mode,
+            regularization=regularization,
+        )
+
+        self.feature_dim = feature_dim
+        self.proj_dim = proj_dim
+        self.seed = seed
+        self.device = device
+
+        # init eig vals and vecs as None
+        self.eigvals = None
+        self.eigvecs = None
+
+    def _arnoldi_iter(  # noqa: PLR6301
+        self,
+        hvp_func: Callable,
+        start_vec: Tensor,
+        n_iters: int,
+        norm_constant: float,
+        tol: float,
+        device: str = "cpu",
+    ) -> Tuple[Tensor, Tensor]:
+        """Applies Arnoldi's algorithm.
+
+        Args:
+            hvp_func (Callable): A function that computes hvp.
+            start_vec (Tensor): A random normalized vector for initialization.
+            n_iters (int): The number of iterations.
+            norm_constant (float): The norm normalization for each projection.
+            tol (float): A tolerance value used to terminate iteration early.
+            device (str): The device to run the algorithm. Defaults to "cpu".
+
+        Returns:
+            The result of the Arnoldi Iteration, containing a Hessenberg
+            matrix H' approximating the Hessian matrix on its Krylov subspace K,
+            and the projections onto K. If H is Hermitian,
+            H' will be a tridiagonal matrix (up to numerical errors).
+        """
+        n_iters = min(start_vec.shape[0] + 1, n_iters)
+
+        proj = []
+        appr_mat = torch.zeros((n_iters, n_iters - 1)).to(device)
+
+        start_vec /= torch.norm(start_vec)
+        proj.append(start_vec)
+
+        for n in range(n_iters - 1):
+            h_vec = hvp_func(proj[n])
+
+            for j, proj_vec in enumerate(proj):
+                appr_mat[j][n] = torch.dot(h_vec, proj_vec) / norm_constant**2
+                h_vec -= appr_mat[j][n] * proj_vec
+
+            new_norm = torch.norm(h_vec)
+            if new_norm < tol:
+                appr_mat[n + 1][n] = 0
+                proj.append(h_vec)
+                appr_mat = appr_mat[: n + 2, : n + 1]
+                break
+
+            appr_mat[n + 1][n] = new_norm / norm_constant
+            h_vec *= 1.0 / appr_mat[n + 1][n]
+            proj.append(h_vec)
+
+        return appr_mat, torch.stack(proj, dim=0)
+
+    def _distill(  # noqa: PLR6301
+        self,
+        appr_mat: Tensor,
+        proj: Tensor,
+        top_k: int,
+        *,
+        force_hermitian: bool = True,
+    ) -> Tuple[Tensor, Tensor]:
+        """Distills result of Arnoldi iteration to top_k eigenvalues and eigenvectors.
+
+        Args:
+            appr_mat (Tensor): The first result from arnoldi_iter. This will be
+                a Hessenberg matrix H' approximating the Hessian H.
+            proj (Tensor): The second result from arnoldi_iter. This will be
+                the projection vectors onto the Krylov subspace K of the
+                Hessian H.
+            top_k (int): Specifies how many eigenvalues and eigenvectors to
+                distill.
+            force_hermitian (bool): Whether to force the Hessian to Hermitian.
+                Defaults to True.
+
+        Returns:
+            The distilled eigenvalues and eigenvectors.
+        """
+        appr_mat = appr_mat[:-1, :]
+
+        if force_hermitian:
+            appr_mat = torch.tril(appr_mat, diagonal=1)
+            appr_mat = 0.5 * (appr_mat + appr_mat.T)
+            eigvals, eigvecs = torch.linalg.eigh(appr_mat)
+        else:
+            eigvals, eigvecs = torch.linalg.eig(appr_mat)
+
+        idx = torch.argsort(torch.abs(eigvals))
+        eigvals = eigvals[idx]
+        eigvecs = eigvecs[:, idx]
+        reduced_projections = torch.matmul(eigvecs[:, -top_k:].T, proj[:-1])
+
+        return eigvals[-top_k:], reduced_projections
+
+    def get_eigenspace(self) -> None:
+        """Compute the approximate eigenspaces of inverse Hessian."""
+        # set torch seed
+        torch.manual_seed(self.seed)
+        # init a random vector
+        v0 = torch.rand(self.feature_dim).to(self.device)
+
+        # perform arnoldi iteration
+        appr_mat, proj = self._arnoldi_iter(
+            self.hvp_at_x_func,
+            v0,
+            self.max_iter,
+            self.norm_constant,
+            self.tol,
+            self.device,
+        )
+
+        # get top k eigenvalues/vectors and cache
+        # proj dim is the value of k
+        self.eigvals, self.eigvecs = self._distill(appr_mat, proj, self.proj_dim)
+
+        # prevent from negative eigvals
+        if self.proj_dim > torch.sum(self.eigvals > self.tol**2):
+            # adjust proj_dim
+            self.proj_dim = torch.sum(self.eigvals > self.tol**2).item()
+            warnings.warn(
+                "Encountered many negative eigenvalues and `proj_dim` is greater"
+                " than the number of positive eigenvalues. Automatically adjusting"
+                " `proj_dim` to the number of positive eigenvalues. Please consider"
+                " increasing `regularization` to reduce negative eigenvalues.",
+                stacklevel=1,
+            )
+
+    def project(self, features: Union[dict, Tensor]) -> Tensor:
+        """Performs the random projection on the feature matrix.
+
+        Args:
+            features (Union[dict, Tensor]): A batch of features or a dictionary
+                of batch of features.
+
+        Returns:
+            Tensor: The projected features.
+        """
+        # Have not computed the eigen space yet
+        if self.eigvals is None or self.eigvecs is None:
+            self.get_eigenspace()
+
+        # Transform to tensors (note: ArnoldiProjector doesn't have self.dtype)
+        if isinstance(features, dict):
+            features = vectorize(features, device=self.device)
+        if features.device.type != self.device:
+            features = features.to(self.device)
+
+        return features @ self.eigvecs.T * (1.0 / torch.sqrt(self.eigvals.unsqueeze(0)))
+
+    def free_memory(self) -> None:
+        """A no-op method."""
+
+
+def make_random_projector(
+    param_shape_list: List,
+    feature_batch_size: int,
+    proj_dim: int,
+    proj_max_batch_size: int,
+    device: torch.device,
+    proj_seed: int = 0,
+    proj_type: ProjectionType = ProjectionType.sjlt,
+    *,
+    dtype: torch.dtype = torch.float32,
+    grass_multiplier: int = 4,
+) -> Tensor:
+    """Initialize random projector by the info of feature about to be projected.
+
+    Args:
+        param_shape_list (List): A list of numbers indicating the total number of
+            features to be projected. A typical example is a list of total parameter
+            size of each module in a torch.nn.Module model. Total parameter size
+            of each module equals to feature_batch_size * param_size of that module.
+        feature_batch_size (int): The batch size of each tensor in the feature
+            about to be projected. The typical type of feature are gradients of
+            torch.nn.Module model but can be restricted to this.
+        proj_dim (int): Dimension of the projected feature.
+        proj_max_batch_size (int): The maximum batch size if the CudaProjector is
+            used. Must be a multiple of 8. The maximum batch size is 32 for A100
+            GPUs, 16 for V100 GPUs, 40 for H100 GPUs.
+        device (torch.device): Device to use. Defaults to cpu.
+        proj_seed (int): Random seed used by the projector. Defaults to 0.
+        proj_type (ProjectionType): The random projection type used for the
+            projection. Available options are "sjlt", "rademacher", "normal",
+            "random_mask", "grass".
+        dtype (torch.dtype): The dtype used in the projector.
+        grass_multiplier (int): For GraSS projection, the multiplier for the
+            intermediate dimension. Only used when proj_type is ProjectionType.grass.
+            Defaults to 4.
+
+    Returns:
+        The initialized projector object
+        (CudaProjector, ChunkedCudaProjector, or BasicProjector).
+    """
+    # the total feature dim
+    feature_dim = sum(param_shape_list)
+
+    projector = BasicProjector if device.type == "cpu" else CudaProjector
+
+    if projector == CudaProjector:
+        max_chunk_size, param_chunk_sizes = get_parameter_chunk_sizes(
+            param_shape_list,
+            proj_max_batch_size,
+        )
+        if len(param_chunk_sizes) == 1:
+            assigned_projector = projector(
+                feature_dim=feature_dim,
+                proj_dim=proj_dim,
+                seed=proj_seed,
+                proj_type=proj_type,
+                device=device,
+                dtype=dtype,
+                grass_multiplier=grass_multiplier,
+            )
+        else:  # we have to use the ChunkedCudaProjector
+            generator = torch.Generator(device=device)
+            generator.manual_seed(proj_seed)
+
+            # Generate seeds using torch.randint
+            seeds = torch.randint(
+                low=0,
+                high=2**31,
+                size=(len(param_chunk_sizes),),
+                generator=generator,
+                dtype=torch.int64,
+                device=device,
+            ).tolist()  # Convert to list for indexing
+
+            projector_per_chunk = [
+                projector(
+                    feature_dim=chunk_size,
+                    proj_dim=proj_dim,
+                    seed=seeds[i],
+                    proj_type=proj_type,
+                    device=device,
+                    dtype=dtype,
+                    grass_multiplier=grass_multiplier,
+                )
+                for i, chunk_size in enumerate(param_chunk_sizes)
+            ]
+            assigned_projector = ChunkedCudaProjector(
+                projector_per_chunk,
+                max_chunk_size,
+                param_chunk_sizes,
+                feature_batch_size,
+                device,
+                dtype,
+            )
+    else:
+        assigned_projector = projector(
+            feature_dim=feature_dim,
+            proj_dim=proj_dim,
+            seed=proj_seed,
+            proj_type=proj_type,
+            dtype=dtype,
+            device=device,
+        )
+
+    return assigned_projector
+
+
+def arnoldi_project(
+    feature_dim: int,
+    func: Callable,
+    x: List,
+    argnums: int = 0,
+    proj_dim: int = 100,
+    max_iter: int = 100,
+    norm_constant: float = 1.0,
+    tol: float = 1e-7,
+    mode: str = "rev-fwd",
+    regularization: float = 0.0,
+    seed: int = 0,
+    device: Union[str, torch.device] = "cpu",
+) -> Callable:
+    """Apply Arnoldi algorithm to approximate iHVP.
+
+    Args:
+        feature_dim (int): Dimension of the features to be projected. Typically,
+            this equals the number of parameters in the model (dimension of the
+            gradient vectors).
+        func (Callable): A Python function that takes one or more arguments.
+            Must return a single-element Tensor. The Hessian will be calculated
+            on this function. The positional arguments to func must all be
+            Tensors.
+        x (List): List of arguments for `func`.
+        argnums (int): An integer defaulting to 0. Specifies which argument of
+            func to compute Hessian with respect to.
+        proj_dim (int): Dimension after the projection. This corresponds to the
+            number of top eigenvalues (top-k eigenvalues) to keep for the
+            Hessian approximation.
+        max_iter (int): An integer defaulting to 100. Specifies the maximum
+            iteration to calculate the ihvp through Arnoldi Iteration.
+        norm_constant (float): A float defaulting to 1.0. Specifies a constant
+            value for the norm of each projection. In some situations (e.g.
+            with a large number of parameters) it might be advisable to set
+            norm_constant > 1 to avoid dividing projection components by a
+            large normalization factor.
+        tol (float): A float defaulting to 1e-7. Specifies the break condition
+            that decides if the algorithm has converged. If the torch.norm of
+            the current basis vector is less than tol, then the algorithm is
+            truncated.
+        mode (str): The auto diff mode, which can have one of the following
+            values:
+            - rev-rev: calculate the Hessian with two reverse-mode auto-diff.
+              It has better compatibility while costing more memory.
+            - rev-fwd: calculate the Hessian with the composition of
+              reverse-mode and forward-mode. It's more memory-efficient but may
+              not be supported by some operators.
+        regularization (float): A float defaulting to 0.0. Specifies the
+            regularization term to be added to the Hessian vector product,
+            which is useful for the later inverse calculation if the Hessian
+            matrix is singular or ill-conditioned. Specifically, the
+            regularization term is `regularization * v`.
+        seed (int): Random seed used by the projector. Defaults to 0.
+        device (Union[str, torch.device]): "cuda" or "cpu". Defaults to "cpu".
+
+    Returns:
+        A function that applies Arnoldi algorithm on input feature.
+    """
+    # init arnoldi projector
+    projector = ArnoldiProjector(
+        feature_dim,
+        proj_dim,
+        func,
+        x,
+        argnums,
+        max_iter,
+        norm_constant,
+        tol,
+        mode,
+        regularization,
+        seed,
+        device,
+    )
+
+    def _arnoldi_project_func(
+        feature: Union[Dict[str, Tensor], Tensor],
+    ) -> Tensor:
+        """The projection function using constructed projector.
+
+        Args:
+            feature (Union[Dict[str, Tensor], Tensor]): The feature needs to be
+                projected. This can simple be a tensor with size [feature_batch_size,
+                feature_dim]. Or typically, if the this is gradient of some
+                torch.nn.Module models, it will have the structure similar to the
+                result of model.named_parameters().
+
+        Returns:
+            The projected result of feature, which is a tensor with size
+                [feature_batch_size, proj_dim].
+        """
+        return projector.project(feature)
+
+    return _arnoldi_project_func
+
+
+def random_project(
+    feature: Union[Dict[str, Tensor], Tensor],
+    feature_batch_size: int,
+    proj_dim: int,
+    proj_max_batch_size: int,
+    proj_seed: int = 0,
+    proj_type: str = "normal",
+    *,
+    device: Union[str, torch.device] = "cpu",
+) -> Callable:
+    """Randomly projects the features to a smaller dimension.
+
+    Args:
+        feature (Union[Dict[str, Tensor], Tensor]): The feature needs to be
+            projected. This can simple be a tensor with size [feature_batch_size,
+            feature_dim]. Or typically, if the this is gradient of some
+            torch.nn.Module models, it will have the structure similar to the
+            result of model.named_parameters().
+        feature_batch_size (int): The batch size of each tensor in the feature
+            about to be projected. The typical type of feature are gradients of
+            torch.nn.Module model but can restricted to this.
+        proj_dim (int): Dimension of the projected feature.
+        proj_max_batch_size (int): The maximum batch size if the CudaProjector is
+            used. Must be a multiple of 8. The maximum batch size is 32 for A100
+            GPUs, 16 for V100 GPUs, 40 for H100 GPUs.
+        proj_seed (int): Random seed used by the projector. Defaults to 0.
+        proj_type (str): The random projection type used for the projection.
+            Available options are "sjlt", "rademacher", "normal", "random_mask",
+            "grass", or "grass_N" where N is the intermediate dimension multiplier
+            (e.g., "grass_4" means intermediate_dim = 4 * proj_dim).
+        device (Union[str, torch.device]): "cuda" or "cpu". Defaults to "cpu".
+
+    Raises:
+        ValueError: When an invalid proj_type or device is provided.
+
+    Returns:
+        A function that takes projects feature to a smaller dimension.
+    """
+    # check the type of feature
+    if isinstance(feature, dict):
+        param_shape_list = [
+            feature[param_name].numel() // feature_batch_size for param_name in feature
+        ]
+        dtype = feature[next(iter(feature))].dtype
+    else:
+        param_shape_list = [feature.numel() // feature_batch_size]
+        dtype = feature.dtype
+
+    # convert device to torch.device if needed
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    # Parse grass multiplier if present (e.g., "grass_4" -> multiplier=4)
+    if isinstance(proj_type, str):
+        proj_type, grass_multiplier = _parse_grass_projection_type(proj_type)
+    else:
+        grass_multiplier = 4
+
+    # convert proj_type to ProjectionType
+    # Define valid projection types for each device
+    proj_type_mapping = {
+        "identity": ProjectionType.identity,
+        "rademacher": ProjectionType.rademacher,
+        "normal": ProjectionType.normal,
+        "random_mask": ProjectionType.random_mask,
+        "sjlt": ProjectionType.sjlt,
+        "grass": ProjectionType.grass,
+    }
+
+    valid_proj_types = {
+        "cpu": {"rademacher", "normal", "random_mask", "identity"},
+        "cuda": {"sjlt", "rademacher", "normal", "random_mask", "grass", "identity"},
+    }
+
+    if device.type not in valid_proj_types:
+        msg = f"Invalid device type {device.type}. \
+            Available options are 'cpu' and 'cuda'."
+        raise ValueError(msg)
+
+    if proj_type not in valid_proj_types[device.type]:
+        available = ", ".join(f"'{t}'" for t in sorted(valid_proj_types[device.type]))
+        grass_note = " (or 'grass_N')" if device.type == "cuda" else ""
+        msg = f"Invalid proj_type '{proj_type}' for {device.type}. \
+            Available options are {available}{grass_note}."
+        raise ValueError(msg)
+
+    proj_type = proj_type_mapping[proj_type]
+
+    projector = make_random_projector(
+        param_shape_list=param_shape_list,
+        feature_batch_size=feature_batch_size,
+        proj_dim=proj_dim,
+        proj_max_batch_size=proj_max_batch_size,
+        device=device,
+        proj_seed=proj_seed,
+        proj_type=proj_type,
+        dtype=dtype,
+        grass_multiplier=grass_multiplier,
+    )
+
+    def _random_project_func(
+        feature: Union[Dict[str, Tensor], Tensor],
+        ensemble_id: int = 0,
+    ) -> Tensor:
+        """The projection function using constructed projector.
+
+        Args:
+            feature (Union[Dict[str, Tensor], Tensor]): The feature needs to be
+                projected. This can simple be a tensor with size [feature_batch_size,
+                feature_dim]. Or typically, if the this is gradient of some
+                torch.nn.Module models, it will have the structure similar to the
+                result of model.named_parameters().
+            ensemble_id (int): A unique ID for this ensemble. Defaults to 0.
+
+        Returns:
+            The projected result of feature, which is a tensor with size
+                [feature_batch_size, proj_dim].
+        """
+        # Check if we should use the memory-efficient dict_project
+        if isinstance(projector, ChunkedCudaProjector) and isinstance(feature, dict):
+            return projector.dict_project(feature, ensemble_id)
+
+        return projector.project(feature, ensemble_id)
+
+    return _random_project_func
